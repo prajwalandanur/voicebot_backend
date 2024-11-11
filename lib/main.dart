@@ -9,7 +9,7 @@ import 'package:http/http.dart' as http;
 import 'package:path/path.dart'; // For using basename
 import 'audio_recorder_ui.dart';
 
-void main() => runApp(MaterialApp(home: AudioRecorder()));
+void main() => runApp(MaterialApp(home: AudioRecorder(), debugShowCheckedModeBanner: false));
 
 class AudioRecorder extends StatefulWidget {
   @override
@@ -18,6 +18,7 @@ class AudioRecorder extends StatefulWidget {
 
 class _AudioRecorderState extends State<AudioRecorder> {
   final FlutterSoundRecorder _recorder = FlutterSoundRecorder();
+  final AudioPlayer _activationPlayer = AudioPlayer();
   bool isRecording = false;
   String _filePath = '/storage/emulated/0/Download/audio_recording.wav';
   final String _uploadUrl = 'https://8vfz7zxh-8000.inc1.devtunnels.ms/upload-audio';
@@ -30,6 +31,7 @@ class _AudioRecorderState extends State<AudioRecorder> {
   void initState() {
     super.initState();
     _initializeRecorder();
+    _loadActivationSound();
   }
 
   Future<void> _initializeRecorder() async {
@@ -39,18 +41,40 @@ class _AudioRecorderState extends State<AudioRecorder> {
     await _recorder.openRecorder();
   }
 
+  Future<void> _loadActivationSound() async {
+    await _activationPlayer.setAsset('assets/activation_sound.wav');
+    _activationPlayer.setVolume(1.0); // Set volume to maximum
+  }
+
+  Future<void> _playActivationSound() async {
+    await _activationPlayer.seek(Duration.zero);
+    await _activationPlayer.play();
+  }
+
+  Future<void> activateBot() async {
+    await _playActivationSound(); // Play activation sound at max volume
+
+    // Wait for activation sound to finish before starting recording
+    _activationPlayer.playerStateStream.listen((state) async {
+      if (state.processingState == ProcessingState.completed) {
+        await startRecording();
+      }
+    });
+  }
+
   Future<void> startRecording() async {
     await _recorder.startRecorder(
       toFile: _filePath,
       codec: Codec.pcm16WAV,
     );
-
     setState(() => isRecording = true);
   }
 
   Future<void> stopRecording() async {
     await _recorder.stopRecorder();
-    setState(() => isRecording = false);
+    setState(() {
+      isRecording = false;
+    });
 
     if (await _requestStoragePermission()) {
       final file = File(_filePath);
@@ -68,67 +92,73 @@ class _AudioRecorderState extends State<AudioRecorder> {
     try {
       var request = http.MultipartRequest('POST', Uri.parse(_uploadUrl));
       request.files.add(await http.MultipartFile.fromPath(
-        'audio',
-        file.path,
-        filename: basename(file.path), // Keep the original filename
-      ));
+          'audio', file.path, filename: basename(file.path)));
+      
       setState(() => _conversation = 'Uploading recording...');
       var response = await request.send();
 
       if (response.statusCode == 200) {
         final responseBody = await response.stream.bytesToString();
         final jsonResponse = json.decode(responseBody);
-
-        // Display "You: " transcription
+        
         String userTranscription = jsonResponse['You'];
         _requestId = jsonResponse['request_id'];
         setState(() => _conversation = "You: $userTranscription");
 
-        // Start fetching the bot's response
         if (_requestId != null) {
           _startFetchingResponse(_requestId!);
         }
       } else {
         setState(() => _conversation = 'Failed to upload recording. Status code: ${response.statusCode}');
       }
+      
     } catch (e) {
       setState(() => _conversation = 'Error uploading recording: $e');
     }
   }
 
-void _startFetchingResponse(String requestId) {
-  _responseTimer?.cancel(); // Cancel any previous timer
-  final player = AudioPlayer(); // Keep a single instance of AudioPlayer
-  
-  _responseTimer = Timer.periodic(Duration(seconds: 2), (timer) async {
-    try {
-      final response = await http.get(Uri.parse('$_getResponseUrl/$requestId'));
-
-      if (response.statusCode == 200) {
-        // Stop any ongoing audio playback before starting a new one
-        if (player.playing) {
-          await player.stop();
-        }
-
-        // Handle MP3 file playback
-        await player.setUrl('$_getResponseUrl/$requestId');
-        await player.play();
+  void _startFetchingResponse(String requestId) {
+    _responseTimer?.cancel();
+    final player = AudioPlayer();
+    
+    _responseTimer = Timer.periodic(Duration(seconds: 4), (timer) async {
+      try {
+        final response = await http.get(Uri.parse('$_getResponseUrl/$requestId'));
         
-        setState(() => _conversation = "$_conversation\nBot: Audio response played.");
-        _responseTimer?.cancel(); // Stop the timer once the response is received
-      } else if (response.statusCode == 202) {
-        setState(() => _conversation = "$_conversation\nBot: Processing...");
-      } else {
-        setState(() => _conversation = "$_conversation\nFailed to fetch response.");
-        _responseTimer?.cancel();
+        if (response.statusCode == 200) {
+          if (player.playing) { 
+            await player.stop(); 
+          }
+          
+          await player.setUrl('$_getResponseUrl/$requestId'); 
+          await player.play(); 
+          
+          setState(() {
+            _conversation = "${_conversation ?? ''}\nBot: Audio response played."; 
+          });
+          
+          _responseTimer?.cancel();
+          
+        } else if (response.statusCode == 202) { 
+          setState(() {
+            _conversation = "${_conversation ?? ''}\nBot: Processing..."; 
+          });
+          
+        } else {   
+          setState(() {
+            _conversation = "${_conversation ?? ''}\nFailed to fetch response."; 
+          });
+          _responseTimer?.cancel(); 
+        }
+        
+      } catch (e) { 
+        setState(() {
+          _conversation = "${_conversation ?? ''}\nError fetching response: $e"; 
+        });
+        _responseTimer?.cancel(); 
       }
-    } catch (e) {
-      setState(() => _conversation = "$_conversation\nError fetching response: $e");
-      _responseTimer?.cancel();
-    }
-  });
-}
-
+    });
+  }
 
   Future<bool> _requestStoragePermission() async {
     return await Permission.storage.isGranted && await Permission.manageExternalStorage.isGranted;
@@ -136,8 +166,9 @@ void _startFetchingResponse(String requestId) {
 
   @override
   void dispose() {
+    _activationPlayer.dispose();
     _recorder.closeRecorder();
-    _responseTimer?.cancel(); // Cancel the timer when disposing
+    _responseTimer?.cancel();
     super.dispose();
   }
 
@@ -146,7 +177,7 @@ void _startFetchingResponse(String requestId) {
     return AudioRecorderUI(
       isRecording: isRecording,
       serverResponse: _conversation,
-      onStartRecording: startRecording,
+      onStartRecording: activateBot,
       onStopRecording: stopRecording,
     );
   }
